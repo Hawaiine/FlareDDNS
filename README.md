@@ -28,6 +28,7 @@
 | 📦 **无限域名** | 数组配置，支持任意数量域名，不再被 5 个限制 |
 | 🤖 **Record ID 自动获取** | 只填域名，脚本自动查 ID，零手工操作 |
 | 🛡️ **全链路校验** | API 认证、记录查找、测速结果 — 每步都有错误提示 |
+| 🔒 **防并发锁** | 自动检测重复运行，防止测速冲突 |
 | 🎨 **彩色日志** | ✅ ❌ ⚠️ 一目了然 |
 | 🔧 **配置脚本分离** | 改配置不动脚本，升级无痛 |
 | 🧹 **自动清理** | 执行完自动删除临时文件 |
@@ -81,9 +82,13 @@ Cloudflare Dashboard → 你的域名 → 右侧概览底部 → **区域 ID**
 ```bash
 cd scripts/
 cp config.example.conf config.conf
-vim config.conf   # 填入 Token、Zone ID、域名列表
+chmod 600 config.conf            # 防止 Token 被其他用户读取
+vim config.conf                  # 填入 Token、Zone ID、域名列表
 bash flare_ddns.sh
 ```
+
+> ⚠️ **安全提醒：** `config.conf` 含有 API Token，已被 `.gitignore` 保护。
+> 执行 `git status` 前确认它不在待提交列表里！
 
 ### 5️⃣ 定时任务（自动优选）
 
@@ -105,16 +110,22 @@ crontab -e
 # ──────── 必填 ────────
 CF_API_TOKEN="你的_API_TOKEN"         # Cloudflare API Token
 CF_ZONE_ID="你的_区域ID"              # Zone ID
-RECORD_NAMES=(                        # 域名数组（最快IP→第一个，以此类推）
+RECORD_NAMES=(                        # 域名数组（最快IP→第一个）
     "cdn1.yourdomain.com"
     "cdn2.yourdomain.com"
 )
 
 # ──────── 可选 ────────
-CFST_ARGS="-p 0"                      # CloudflareST 参数
+CFST_ARGS="-p 0"                      # CloudflareST 参数（别写 -o，脚本会加）
 DNS_TTL=60                            # TTL 秒 (60=自动)
-DNS_PROXIED=false                     # 是否开启 CDN 代理
+DNS_PROXIED=false                     # 是否开启 CDN 代理 (orange cloud)
+                                      # ⚠️ 开启后客户端走 Anycast 而非优选 IP
 ```
+
+### ⚠️ 关键注意事项
+
+- **不要在 `CFST_ARGS` 里写 `-o`** — 脚本会自动追加输出路径 `-o result.csv`
+- **`DNS_PROXIED=true` 时** TTL 会被 Cloudflare 强制设为 auto(60)，且客户端走 Anycast 网络而非你测速选出的源站 IP，「优选 IP」提速效果会大打折扣
 
 ### CloudflareST 常用参数
 
@@ -145,9 +156,9 @@ $ bash flare_ddns.sh
   # CloudflareST 正在测速中...
 
 📡 正在更新 DNS 记录...
-  [1] 更新 cdn1.yourdomain.com → 104.16.xxx.xxx
+  [1/2] 更新 cdn1.yourdomain.com → 104.16.xxx.xxx
     ✔  更新成功
-  [2] 更新 cdn2.yourdomain.com → 104.17.xxx.xxx
+  [2/2] 更新 cdn2.yourdomain.com → 104.17.xxx.xxx
     ✔  更新成功
 
 🎉 完成！共更新 2/2 条 DNS 记录
@@ -159,12 +170,13 @@ $ bash flare_ddns.sh
 
 ```
 FlareDDNS/
-├── scripts/
-│   ├── flare_ddns.sh          # 🔧 主脚本
-│   ├── config.example.conf    # 📝 配置模板（复制为 config.conf）
-│   ├── config.conf            # ⚙️ 你的配置
-│   └── cfst                   # 🏃 CloudflareST 工具
-└── README.md                  # 📖 说明文档
+├── .gitignore                 # 🔒 忽略 config.conf、cfst、*.log
+├── README.md                  # 📖 说明文档
+└── scripts/
+    ├── flare_ddns.sh          # 🔧 主脚本
+    ├── config.example.conf    # 📝 配置模板（复制为 config.conf）
+    ├── config.conf            # ⚙️ 你的配置（已在 .gitignore 中）
+    └── cfst                   # 🏃 CloudflareST 工具
 ```
 
 ---
@@ -177,6 +189,9 @@ FlareDDNS/
 | 📦 域名数 | 固定 5 个，重复代码 | 数组，任意数量 |
 | 🆔 Record ID | 手动查了填 | 自动获取 |
 | 🛡️ 容错 | 失败无感知 | 每步校验+提示 |
+| 🔐 防并发 | 无 | flock 锁 |
+| 🚫 隔离性 | 输出路径不可控 | -o 强制绑定到脚本目录 |
+| 🔒 安全 | — | .gitignore 防 Token 泄露 |
 | 🎨 输出 | 白底黑字 | 彩色日志 |
 | ⚙️ 配置 | 硬编码在脚本里 | 独立配置文件 |
 | 📋 验证 | 无 | 配置完整性检查 |
@@ -206,6 +221,25 @@ FlareDDNS/
 <summary><strong>Q: 还需要手动查 Record ID 吗？</strong></summary>
 
 **不用了** 🎉 新版脚本通过 API 自动获取所有 A 记录的 Name → ID 映射，你只需在 `RECORD_NAMES` 数组里填域名即可。
+</details>
+
+<details>
+<summary><strong>Q: 不小心把带着 Token 的 config.conf 提交了怎么办？</strong></summary>
+
+1. **立即在 Cloudflare 后台撤销该 Token**
+2. 创建新 Token
+3. 在仓库中执行 `git rm --cached scripts/config.conf` 解除追踪
+4. 确认 `.gitignore` 已包含 `config.conf`
+5. 后续操作参考 [GitHub 官方文档 — 从仓库中移除敏感数据](https://docs.github.com/zh/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)
+</details>
+
+<details>
+<summary><strong>Q: DNS_PROXIED=true 有什么影响？</strong></summary>
+
+开启 CDN 代理（橙色云）后：
+- TTL 被 Cloudflare 强制设为 auto(60)，`DNS_TTL` 设置失效
+- 客户端访问走 Cloudflare Anycast 网络，而非你测速选出的具体源站 IP
+- 「优选 IP 提速」效果基本失效，建议保持 `false`
 </details>
 
 ---

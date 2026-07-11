@@ -11,10 +11,17 @@
 
 set -euo pipefail
 
-# ---- 加载配置 ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.conf"
 
+# ---- 防并发锁 ----
+exec 200>"${SCRIPT_DIR}/.flare_ddns.lock"
+flock -n 200 || {
+    echo "❌ 已有 FlareDDNS 实例在运行，跳过本次执行"
+    exit 1
+}
+
+# ---- 加载配置 ----
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "❌ 错误: 配置文件不存在: $CONFIG_FILE"
     echo "   请复制 config.example.conf 为 config.conf 并编辑"
@@ -107,12 +114,18 @@ for r in data.get('result', []):
 done
 
 if [ ${#not_found[@]} -gt 0 ]; then
-    echo -e "\n${YELLOW}⚠️  以下域名未在 Zone 中找到，请检查域名是否正确:${NC}"
+    echo -e "\n${YELLOW}⚠️  以下域名未在 Zone 中找到，将被跳过:${NC}"
     printf "  • %s\n" "${not_found[@]}"
     echo "  可通过 Cloudflare 后台 → DNS → 确认域名拼写"
 fi
 
-if [ ${#RECORD_IDS[@]} -eq 0 ]; then
+# 过滤掉未找到的域名，避免浪费最快 IP 位
+FILTERED_NAMES=()
+for name in "${RECORD_NAMES[@]}"; do
+    [ -n "${RECORD_IDS[$name]:-}" ] && FILTERED_NAMES+=("$name")
+done
+
+if [ ${#FILTERED_NAMES[@]} -eq 0 ]; then
     echo -e "\n${RED}❌ 没有找到任何有效的 DNS 记录，退出${NC}"
     exit 1
 fi
@@ -121,12 +134,9 @@ fi
 echo -e "\n${CYAN}🚀 正在运行 CloudflareSpeedTest 测速...${NC}"
 RESULT_CSV="${SCRIPT_DIR}/result.csv"
 
-if [ -n "${CFST_ARGS:-}" ]; then
-    # shellcheck disable=SC2086
-    "$CFST_BIN" $CFST_ARGS
-else
-    "$CFST_BIN" -p 0 -o "${SCRIPT_DIR}/result.csv"
-fi
+# ⚠️ -o 由脚本自动追加，不要在 CFST_ARGS 里自行写 -o
+# shellcheck disable=SC2086
+"$CFST_BIN" ${CFST_ARGS:-"-p 0"} -o "$RESULT_CSV"
 
 if [ ! -f "$RESULT_CSV" ]; then
     echo -e "${RED}❌ 测速失败，未生成 result.csv${NC}"
@@ -141,41 +151,38 @@ PROXIED="${DNS_PROXIED:-false}"
 
 updated=0
 n=0
+total="${#FILTERED_NAMES[@]}"
 
 while IFS=',' read -r ip rest; do
     [ -z "$ip" ] && continue
 
+    # 已经拿到足够的 IP 了就退出循环
+    [ "$n" -ge "$total" ] && break
+
     n=$((n + 1))
     idx=$((n - 1))
+    name="${FILTERED_NAMES[$idx]}"
+    record_id="${RECORD_IDS[$name]}"
 
-    if [ $idx -lt ${#RECORD_NAMES[@]} ]; then
-        name="${RECORD_NAMES[$idx]}"
-        record_id="${RECORD_IDS[$name]:-}"
+    echo -e "  ${CYAN}[$n/$total]${NC} 更新 $name → ${GREEN}$ip${NC}"
 
-        if [ -z "$record_id" ]; then
-            echo -e "  ${YELLOW}⏭  跳过 $name（无对应 Record ID）${NC}"
-            continue
-        fi
+    response=$(cf_api "PUT" "/zones/$CF_ZONE_ID/dns_records/$record_id" \
+        "{\"type\":\"A\",\"name\":\"$name\",\"content\":\"$ip\",\"ttl\":$TTL,\"proxied\":$PROXIED}")
 
-        echo -e "  ${CYAN}[$n]${NC} 更新 $name → ${GREEN}$ip${NC}"
-
-        response=$(cf_api "PUT" "/zones/$CF_ZONE_ID/dns_records/$record_id" \
-            "{\"type\":\"A\",\"name\":\"$name\",\"content\":\"$ip\",\"ttl\":$TTL,\"proxied\":$PROXIED}")
-
-        success=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
-        if [ "$success" = "True" ]; then
-            echo -e "    ${GREEN}✔  更新成功${NC}"
-            updated=$((updated + 1))
-        else
-            error_msg=$(echo "$response" | python3 -c "import sys,json; e=json.load(sys.stdin).get('errors',[{}])[0]; print(e.get('message','?'))" 2>/dev/null)
-            echo -e "    ${RED}✘  更新失败: $error_msg${NC}"
-        fi
+    success=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success', False))" 2>/dev/null)
+    if [ "$success" = "True" ]; then
+        echo -e "    ${GREEN}✔  更新成功${NC}"
+        updated=$((updated + 1))
+    else
+        error_msg=$(echo "$response" | python3 -c "import sys,json; e=json.load(sys.stdin).get('errors',[{}])[0]; print(e.get('message','?'))" 2>/dev/null)
+        echo -e "    ${RED}✘  更新失败: $error_msg${NC}"
     fi
 done < <(tail -n +2 "$RESULT_CSV")
 
 rm -f "$RESULT_CSV"
 
-echo -e "\n${GREEN}🎉 完成！共更新 $updated/${#RECORD_NAMES[@]} 条 DNS 记录${NC}"
-if [ "$updated" -lt "${#RECORD_NAMES[@]}" ]; then
-    echo -e "${YELLOW}💡 提示: 可能测速结果不足以覆盖所有域名，或部分域名未在 DNS 中找到${NC}"
+echo -e "\n${GREEN}🎉 完成！共更新 $updated/$total 条 DNS 记录${NC}"
+if [ "$updated" -lt "$total" ]; then
+    echo -e "${YELLOW}💡 提示: 可能测速结果不足以覆盖所有域名${NC}"
+    exit 1
 fi

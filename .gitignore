@@ -1,0 +1,14 @@
+# ── 用户配置（包含 API Token！禁止提交） ──
+config.conf
+
+# ── CloudflareST 可执行文件（太大，不应入仓） ──
+cfst
+
+# ── 测速临时文件 ──
+result.csv
+
+# ── 运行日志 ──
+*.log
+
+# ── 并发锁（自动生成） ──
+.flare_ddns.lock
